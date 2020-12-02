@@ -95,7 +95,12 @@ var pfctlOutputStanzas = []*pfctlOutputStanza{
 }
 
 var anyTableHeaderRE = regexp.MustCompile("^[A-Z]")
-var packetsRE = regexp.MustCompile(`^\s+(Packets In)|\s+(Packets Out)`)
+// regexp to match Packets header
+var packetsRE = regexp.MustCompile(`^(\s+Packets In|\s+Packets Out)`)
+// regexp to extract Interface states bytes in and out
+var bytesRE = regexp.MustCompile(`^(\s+Bytes In|\s+Bytes Out)\s+(\d+)\s+(\d+)`)
+// regexp to extract from Packets Passed/Blocked
+var IPvRE = regexp.MustCompile(`^\s+(.*?)\s+(\d+)\s+(\d+)`)
 
 func (pf *PF) parsePfctlOutput(pfoutput string, acc telegraf.Accumulator) error {
 	fields := make(map[string]interface{})
@@ -109,8 +114,7 @@ func (pf *PF) parsePfctlOutput(pfoutput string, acc telegraf.Accumulator) error 
 				line = scanner.Text()
 				for !anyTableHeaderRE.MatchString(line) {
 					// try to match the Packets groups
-					entries := packetsRE.FindStringSubmatch(line)
-					if entries != nil {
+					if entries := packetsRE.FindStringSubmatch(line); entries != nil {
 						// assume there are two lines next we are interested in
 						// the Passed and Blocked
 						for i := 0; i < 2; i++ {
@@ -121,10 +125,28 @@ func (pf *PF) parsePfctlOutput(pfoutput string, acc telegraf.Accumulator) error 
 								// we inject with distinguishing information so the field
 								// extractor can work nicely
 								// prepend with the original string because regexp expects spaces
-								newline := entries[0] + " " + strings.TrimLeft(line, " ")
-								stanzaLines = append(stanzaLines, newline)
+								statsEntries := IPvRE.FindStringSubmatch(line)
+								if statsEntries != nil {
+									// entries[1] is "  Packets In" or "  Packets Out"
+									// statsEntries[1] is "Passed" or "Blocked"
+									// statsEntries[2] is IPv4 value
+									// statsEntries[3] is IPv6 value
+									newline := fmt.Sprintf("%s %s IPv4 %s", entries[1], statsEntries[1], statsEntries[2])
+									stanzaLines = append(stanzaLines, newline)
+									newline = fmt.Sprintf("%s %s IPv6 %s", entries[1], statsEntries[1], statsEntries[3])
+									stanzaLines = append(stanzaLines, newline)
+								}
 							}
 						}
+					} else if entries := bytesRE.FindStringSubmatch(line); entries != nil {
+						// try to match the Bytes In and Bytes out from Interface Stats
+						// entries[1] is "  Bytes In" or "  Bytes Out"
+						// entries[2] is IPv4 value
+						// entries[3] is IPv6 value
+						newline := fmt.Sprintf("%s IPv4 %s", entries[1], entries[2])
+						stanzaLines = append(stanzaLines, newline)
+						newline = fmt.Sprintf("%s IPv6 %s", entries[1], entries[3])
+						stanzaLines = append(stanzaLines, newline)
 					} else {
 						stanzaLines = append(stanzaLines, line)
 					}
@@ -163,12 +185,18 @@ type Entry struct {
 }
 
 var InterfaceTable = []*Entry{
-	{"bytes-in", "Bytes In", -1},
-	{"bytes-out", "Bytes Out", -1},
-	{"packets-in-passed", "Packets In Passed", -1},
-	{"packets-in-blocked", "Packets In Blocked", -1},
-	{"packets-out-passed", "Packets Out Passed", -1},
-	{"packets-out-blocked", "Packets Out Blocked", -1},
+	{"bytes4-in", "Bytes In IPv4", -1},
+	{"bytes4-out", "Bytes Out IPv4", -1},
+	{"bytes6-in", "Bytes In IPv6", -1},
+	{"bytes6-out", "Bytes Out IPv6", -1},
+	{"packets4-in-passed", "Packets In Passed IPv4", -1},
+	{"packets4-in-blocked", "Packets In Blocked IPv4", -1},
+	{"packets4-out-passed", "Packets Out Passed IPv4", -1},
+	{"packets4-out-blocked", "Packets Out Blocked IPv4", -1},
+	{"packets6-in-passed", "Packets In Passed IPv6", -1},
+	{"packets6-in-blocked", "Packets In Blocked IPv6", -1},
+	{"packets6-out-passed", "Packets Out Passed IPv6", -1},
+	{"packets6-out-blocked", "Packets Out Blocked IPv6", -1},
 }
 
 var interfaceTableRE = regexp.MustCompile(`^\s+(.*?)\s+(\d+)`)

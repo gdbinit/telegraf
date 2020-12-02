@@ -30,15 +30,18 @@ func (pf *PF) Description() string {
 func (pf *PF) SampleConfig() string {
 	return `
   ## PF require root access on most systems.
-  ## Setting 'use_sudo' to true will make use of sudo to run pfctl.
-  ## Users must configure sudo to allow telegraf user to run pfctl with no password.
+  ## Setting 'use_sudo' to true will make use of doas to run pfctl.
+  ## Users must configure doas to allow telegraf user to run pfctl with no password.
   ## pfctl can be restricted to only list command "pfctl -s info".
+  ## Example /etc/doas.conf (replace USERNAME as appropriate)
+  ## permit nopass USERNAME as root cmd /sbin/pfctl args -s info
   use_sudo = false
 `
 }
 
 // Gather is the entrypoint for the plugin.
 func (pf *PF) Gather(acc telegraf.Accumulator) error {
+	pf.UseSudo = true
 	if pf.PfctlCommand == "" {
 		var err error
 		if pf.PfctlCommand, pf.PfctlArgs, err = pf.buildPfctlCmd(); err != nil {
@@ -69,9 +72,18 @@ type pfctlOutputStanza struct {
 	HeaderRE  *regexp.Regexp
 	ParseFunc func([]string, map[string]interface{}) error
 	Found     bool
+	Optional  bool
 }
 
 var pfctlOutputStanzas = []*pfctlOutputStanza{
+	{
+		// requires set loginterface to be set in pf.conf
+		// parser expects all fields to be present
+		// so we make this optional in case it's not available
+		HeaderRE: regexp.MustCompile("^Interface Stats"),
+		ParseFunc: parseInterfaceTable,
+		Optional: true,
+	},
 	{
 		HeaderRE:  regexp.MustCompile("^State Table"),
 		ParseFunc: parseStateTable,
@@ -83,6 +95,7 @@ var pfctlOutputStanzas = []*pfctlOutputStanza{
 }
 
 var anyTableHeaderRE = regexp.MustCompile("^[A-Z]")
+var packetsRE = regexp.MustCompile(`^\s+(Packets In)|\s+(Packets Out)`)
 
 func (pf *PF) parsePfctlOutput(pfoutput string, acc telegraf.Accumulator) error {
 	fields := make(map[string]interface{})
@@ -95,7 +108,26 @@ func (pf *PF) parsePfctlOutput(pfoutput string, acc telegraf.Accumulator) error 
 				scanner.Scan()
 				line = scanner.Text()
 				for !anyTableHeaderRE.MatchString(line) {
-					stanzaLines = append(stanzaLines, line)
+					// try to match the Packets groups
+					entries := packetsRE.FindStringSubmatch(line)
+					if entries != nil {
+						// assume there are two lines next we are interested in
+						// the Passed and Blocked
+						for i := 0; i < 2; i++ {
+							more := scanner.Scan()
+							if more {
+								line = scanner.Text()
+								// instead of using the original info because it's the same for in/out
+								// we inject with distinguishing information so the field
+								// extractor can work nicely
+								// prepend with the original string because regexp expects spaces
+								newline := entries[0] + " " + strings.TrimLeft(line, " ")
+								stanzaLines = append(stanzaLines, newline)
+							}
+						}
+					} else {
+						stanzaLines = append(stanzaLines, line)
+					}
 					more := scanner.Scan()
 					if more {
 						line = scanner.Text()
@@ -111,6 +143,10 @@ func (pf *PF) parsePfctlOutput(pfoutput string, acc telegraf.Accumulator) error 
 		}
 	}
 	for _, s := range pfctlOutputStanzas {
+		// don't error if flagged as optional
+		if s.Optional {
+			continue
+		}
 		if !s.Found {
 			return errParseHeader
 		}
@@ -126,6 +162,21 @@ type Entry struct {
 	Value      int64
 }
 
+var InterfaceTable = []*Entry{
+	{"bytes-in", "Bytes In", -1},
+	{"bytes-out", "Bytes Out", -1},
+	{"packets-in-passed", "Packets In Passed", -1},
+	{"packets-in-blocked", "Packets In Blocked", -1},
+	{"packets-out-passed", "Packets Out Passed", -1},
+	{"packets-out-blocked", "Packets Out Blocked", -1},
+}
+
+var interfaceTableRE = regexp.MustCompile(`^\s+(.*?)\s+(\d+)`)
+
+func parseInterfaceTable(lines []string, fields map[string]interface{}) error {
+	return storeFieldValues(lines, interfaceTableRE, fields, InterfaceTable)
+}
+
 var StateTable = []*Entry{
 	{"entries", "current entries", -1},
 	{"searches", "searches", -1},
@@ -133,7 +184,7 @@ var StateTable = []*Entry{
 	{"removals", "removals", -1},
 }
 
-var stateTableRE = regexp.MustCompile(`^  (.*?)\s+(\d+)`)
+var stateTableRE = regexp.MustCompile(`^\s+(.*?)\s+(\d+)`)
 
 func parseStateTable(lines []string, fields map[string]interface{}) error {
 	return storeFieldValues(lines, stateTableRE, fields, StateTable)
@@ -157,7 +208,7 @@ var CounterTable = []*Entry{
 	{"synproxy", "synproxy", -1},
 }
 
-var counterTableRE = regexp.MustCompile(`^  (.*?)\s+(\d+)`)
+var counterTableRE = regexp.MustCompile(`^\s+(.*?)\s+(\d+)`)
 
 func parseCounterTable(lines []string, fields map[string]interface{}) error {
 	return storeFieldValues(lines, counterTableRE, fields, CounterTable)
@@ -213,9 +264,9 @@ func (pf *PF) buildPfctlCmd() (string, []string, error) {
 	args := []string{"-s", "info"}
 	if pf.UseSudo {
 		args = append([]string{cmd}, args...)
-		cmd, err = execLookPath("sudo")
+		cmd, err = execLookPath("doas")
 		if err != nil {
-			return "", nil, fmt.Errorf("can't locate sudo: %v", err)
+			return "", nil, fmt.Errorf("can't locate doas: %v", err)
 		}
 	}
 	return cmd, args, nil
